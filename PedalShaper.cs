@@ -12,13 +12,19 @@ namespace PedalShaper
     // Effect machine: bool Work(Sample[] output, Sample[] input, int n,
     // WorkModes mode).  Signal flow per sample (PedalComp §1):
     //
-    //     input (±32768)        ── multiply by SCALE  ─→  in (±1.0)
-    //                            ↓
+    //     input (±32768)        ── multiply by SCALE  ─→  dry (±1.0)
+    //                            ↓                          ↓
+    //                            ↓        dust env follower (v1.2)
+    //                            ↓               ↓
     //         pre-tone tilt (one-pole split, mix low/high bands)
     //                            ↓
     //         drive_lin gain  +  Bias DC offset
     //                            ↓
+    //         + √env · dust noise          ← v1.1 (off when Dust=0)
+    //                            ↓             (v1.2 — env-driven; was |x|-driven)
     //         waveshaper (Soft / Hard / Tube / Fold / Crush)
+    //                            ↓
+    //         hysteresis (asymmetric one-pole lag)  ← v1.1 (off when Hysteresis=0)
     //                            ↓
     //         DC blocker (removes Bias + asymmetric-shape DC drift)
     //                            ↓
@@ -37,6 +43,19 @@ namespace PedalShaper
     // offset trick per PedalComp §2 — every property setter receives a
     // value in [MinValue..MaxValue] with the signed reading reconstructed
     // by subtracting an offset.
+    //
+    // v1.1 texture additions (Hysteresis, Dust) appended to the parameter
+    // list per Build §3.3 — v1.0 preset bundles load with both at their
+    // DefValue of 0, producing v1.0-identical output bit-for-bit.
+    //
+    // v1.2 revises the Dust amplitude detector: an envelope follower on
+    // the dry-input magnitude (fast attack, slow release) replaces v1.1's
+    // instantaneous √|drL|.  Audible result is dust that rides on top of
+    // the program material with a natural noise-tail after notes end,
+    // rather than v1.1's per-sample modulation that hugged the waveform
+    // and leaked through silence when Bias was non-default.  No parameter
+    // changes — v1.1 presets load unchanged, but presets with Dust > 0
+    // sound different (less waveform-correlated, more layer-like).
     [MachineDecl(
         Name        = "Pedal Shaper",
         ShortName   = "Shaper",
@@ -72,19 +91,36 @@ namespace PedalShaper
         // Tone offset.  64 = flat (low_gain == high_gain == 1.0).
         const int   TONE_OFFSET    = 64;
 
+        // Dust envelope-follower time constants (v1.2).  The follower
+        // smooths the dry-input magnitude into the level the dust gain
+        // tracks against, so dust feels like a layer over the program
+        // material rather than per-sample-|x| modulation tied to the
+        // waveform.  Attack is short enough to keep transients audible
+        // through the noise; release is long enough that the noise tail
+        // outlives short notes (the "ADSR overlap" character).
+        // These are fixed — not user-facing parameters — to keep the
+        // pedal surface small.  Future v1.x could expose them if needed.
+        const float DUST_ATTACK_MS  = 5f;
+        const float DUST_RELEASE_MS = 200f;
+
         // ── Host & per-channel state ──────────────────────────────────────
 
         readonly IBuzzMachineHost _host;
-        readonly ChannelFilters _chL = new ChannelFilters();
-        readonly ChannelFilters _chR = new ChannelFilters();
+        // Distinct seeds so the L/R xorshift32 streams (Filters.cs) are
+        // statistically independent.  Two arbitrary non-zero 32-bit
+        // constants — any pair with high Hamming distance works.
+        readonly ChannelFilters _chL = new ChannelFilters(0xC0DEC0DEu);
+        readonly ChannelFilters _chR = new ChannelFilters(0xDEADBEEFu);
 
         // ── Cached / dirty-checked coefficients (PedalComp §6) ────────────
-        int   _cachedSr     = 0;
-        int   _cachedDrive  = -1;
-        int   _cachedOutput = -1;
-        int   _cachedTone   = -1;
-        int   _cachedBias   = -1;
-        int   _cachedMix    = -1;
+        int   _cachedSr         = 0;
+        int   _cachedDrive      = -1;
+        int   _cachedOutput     = -1;
+        int   _cachedTone       = -1;
+        int   _cachedBias       = -1;
+        int   _cachedMix        = -1;
+        int   _cachedHysteresis = -1;   // v1.1
+        int   _cachedDust       = -1;   // v1.1
 
         float _driveLin   = 1f;       // amplitude multiplier from Drive
         float _outputLin  = 1f;       // amplitude multiplier from Output
@@ -94,6 +130,11 @@ namespace PedalShaper
         float _mixDry     = 0f;       // 0..1 dry coefficient
         float _mixWet     = 1f;       // 0..1 wet coefficient
         float _toneLpCoef = 0.1f;     // pushed into both ChannelFilters
+        float _hystUpCoef   = 1f;     // v1.1 — 1.0 at Hysteresis=0 (transparent)
+        float _hystDownCoef = 1f;     // v1.1 — 1.0 at Hysteresis=0 (transparent)
+        float _dustGain     = 0f;     // v1.1 — 0   at Dust=0       (transparent)
+        float _dustAttackCoef  = 0f;  // v1.2 — buffer-rate; depends only on sr
+        float _dustReleaseCoef = 0f;  // v1.2 — buffer-rate; depends only on sr
 
         // ── Constructor — store the host, init filter state ───────────────
         // Per Core §15, ParameterGroups is NOT yet populated here.  Stick
@@ -168,6 +209,39 @@ namespace PedalShaper
             DefValue     = 48)]
         public int Output { get; set; } = 48;
 
+        // ── v1.1 texture controls ─────────────────────────────────────────
+        // Both default to 0 (off).  v1.0 preset bundles that don't mention
+        // these parameters load with their DefValue, which yields output
+        // bit-identical to v1.0 behaviour.  Per Build §3.3, the append-
+        // only rule preserves the preset contract; future v1.x texture
+        // additions should follow the same pattern below these.
+
+        // 7. Hysteresis — asymmetric one-pole lag on the shaper output.
+        //    Fast on rising, slow on falling — models the tape/transformer
+        //    "release smear" character.  At 0, both up/down coefs are 1.0
+        //    and the stage is mathematically transparent (no audible LP).
+        [ParameterDecl(
+            Name         = "Hysteresis",
+            Description  = "Tape-like asymmetric release smear (0 = off)",
+            MinValue     = 0,
+            MaxValue     = 127,
+            DefValue     = 0)]
+        public int Hysteresis { get; set; } = 0;
+
+        // 8. Dust — signal-correlated white noise injected before the
+        //    shaper.  Amplitude is scaled by √|x| so silence stays silent
+        //    and louder passages get progressively more grain.  The L/R
+        //    PRNG streams are independently seeded (see field init) so
+        //    the dust gives free stereo decorrelation even on mono input.
+        //    At 0, the dust gain is exactly 0 — no contribution, transparent.
+        [ParameterDecl(
+            Name         = "Dust",
+            Description  = "Signal-correlated noise grain (0 = off, tracks |x|)",
+            MinValue     = 0,
+            MaxValue     = 127,
+            DefValue     = 0)]
+        public int Dust { get; set; } = 0;
+
         // ───────────────────────────────────────────────────────────────────
         // Coefficient cache (PedalComp §6)
         //
@@ -177,21 +251,26 @@ namespace PedalShaper
         void UpdateCoefficients(int sr)
         {
             if (sr == _cachedSr
-                && Drive  == _cachedDrive
-                && Output == _cachedOutput
-                && Tone   == _cachedTone
-                && Bias   == _cachedBias
-                && Mix    == _cachedMix)
+                && Drive       == _cachedDrive
+                && Output      == _cachedOutput
+                && Tone        == _cachedTone
+                && Bias        == _cachedBias
+                && Mix         == _cachedMix
+                && Hysteresis  == _cachedHysteresis
+                && Dust        == _cachedDust)
                 return;
 
-            bool srChanged = (sr != _cachedSr);
+            bool srChanged       = (sr != _cachedSr);
+            bool hystChanged     = (Hysteresis != _cachedHysteresis);
 
-            _cachedSr     = sr;
-            _cachedDrive  = Drive;
-            _cachedOutput = Output;
-            _cachedTone   = Tone;
-            _cachedBias   = Bias;
-            _cachedMix    = Mix;
+            _cachedSr         = sr;
+            _cachedDrive      = Drive;
+            _cachedOutput     = Output;
+            _cachedTone       = Tone;
+            _cachedBias       = Bias;
+            _cachedMix        = Mix;
+            _cachedHysteresis = Hysteresis;
+            _cachedDust       = Dust;
 
             // Drive / Output dB → linear.  Done at coefficient time, so
             // the cost of MathF.Pow is paid once per parameter change,
@@ -221,12 +300,61 @@ namespace PedalShaper
 
             // Tone filter coefficient — only recompute on actual SR change.
             // The cutoff is fixed; only its discretisation depends on sr.
+            // Dust envelope-follower coefs (v1.2) live in the same block
+            // for the same reason: they're sample-rate-dependent only.
             if (srChanged && sr > 0)
             {
                 _toneLpCoef = 1f - MathF.Exp(-2f * MathF.PI * TONE_REF_HZ / sr);
                 _chL.SetToneCoef(_toneLpCoef);
                 _chR.SetToneCoef(_toneLpCoef);
+
+                float attSamps = DUST_ATTACK_MS  * sr * 0.001f;
+                float relSamps = DUST_RELEASE_MS * sr * 0.001f;
+                _dustAttackCoef  = (attSamps > 0.001f) ? (1f - MathF.Exp(-1f / attSamps)) : 1f;
+                _dustReleaseCoef = (relSamps > 0.001f) ? (1f - MathF.Exp(-1f / relSamps)) : 1f;
             }
+
+            // ── v1.1 ───────────────────────────────────────────────────────
+            // Hysteresis — map the 0..127 knob to up/down time constants.
+            //
+            //   upMs ranges 0..1 ms      (transients stay relatively crisp)
+            //   downMs ranges 0..10 ms   (release smear grows perceptibly)
+            //
+            // Translate ms → one-pole coefficient via the standard
+            //   coef = 1 − exp(−1/samples_per_tc).
+            // At Hysteresis=0 both ms are 0 and we explicitly set the
+            // coefs to 1.0 (the limit case) — this guarantees bit-exact
+            // transparency rather than depending on Exp(−∞)→0 behaviour.
+            //
+            // The recompute is gated on hystChanged || srChanged because
+            // the conversion is sample-rate-dependent; we'd otherwise
+            // silently get the wrong time constant if SR changed without
+            // the user touching Hysteresis.
+            if (hystChanged || srChanged)
+            {
+                if (Hysteresis <= 0 || sr <= 0)
+                {
+                    _hystUpCoef   = 1f;
+                    _hystDownCoef = 1f;
+                }
+                else
+                {
+                    float hystN     = Hysteresis / 127f;
+                    float upSamps   = (hystN *  1f) * sr * 0.001f;
+                    float downSamps = (hystN * 10f) * sr * 0.001f;
+                    _hystUpCoef   = (upSamps   > 0.001f) ? (1f - MathF.Exp(-1f / upSamps))   : 1f;
+                    _hystDownCoef = (downSamps > 0.001f) ? (1f - MathF.Exp(-1f / downSamps)) : 1f;
+                }
+            }
+
+            // Dust gain.  Knob is linear and very gentle — peak per-sample
+            // contribution is dustGain · √|x| · 0.5 (PRNG returns ±0.5),
+            // so at Dust=127 and full-scale input the per-sample dust
+            // peaks at 0.4 in normalised scale, i.e. clearly audible
+            // grain without overwhelming the signal.  At Dust=0 the gain
+            // is exactly 0 so the unconditional mul-add in the hot loop
+            // is mathematically transparent.
+            _dustGain = (Dust / 127f) * 0.8f;
         }
 
         // ───────────────────────────────────────────────────────────────────
@@ -264,12 +392,30 @@ namespace PedalShaper
             float toneHigh = _toneHighGain;
             float mixDry   = _mixDry;
             float mixWet   = _mixWet;
+            float hystUp   = _hystUpCoef;     // v1.1; 1.0 when Hysteresis=0
+            float hystDown = _hystDownCoef;   // v1.1; 1.0 when Hysteresis=0
+            float dustG    = _dustGain;       // v1.1; 0   when Dust=0
+            float dustAtt  = _dustAttackCoef;  // v1.2; sample-rate-dependent
+            float dustRel  = _dustReleaseCoef; // v1.2; sample-rate-dependent
 
             for (int i = 0; i < n; i++)
             {
                 // ── 1. ±32768 → ±1.0 ───────────────────────────────────
                 float dryL = input[i].L * SCALE;
                 float dryR = input[i].R * SCALE;
+
+                // ── 1b. Dust envelope follower (v1.2) ─────────────────
+                // Asymmetric AR follower on the dry input magnitude.
+                // The env state stays well-defined per channel and is
+                // bumped every sample regardless of Dust setting — same
+                // rationale as the unconditional PRNG advance below
+                // (keeps the env continuous if Dust is dialled in
+                // mid-render).  Tracked off dryL/dryR, NOT off drL/drR,
+                // so Bias and Drive don't bleed noise into silence —
+                // the v1.1 bug where non-default Bias kept dust audible
+                // at zero input is fixed by this choice.
+                float envL = _chL.DustEnv(MathF.Abs(dryL), dustAtt, dustRel);
+                float envR = _chR.DustEnv(MathF.Abs(dryR), dustAtt, dustRel);
 
                 // ── 2. Pre-tone tilt ───────────────────────────────────
                 float toL = _chL.ApplyTone(dryL, toneLow, toneHigh);
@@ -279,9 +425,29 @@ namespace PedalShaper
                 float drL = toL * driveLin + biasLin;
                 float drR = toR * driveLin + biasLin;
 
+                // ── 3b. Dust (v1.1, scaling revised in v1.2) ──────────
+                // Inject signal-correlated noise pre-shaper.  Amplitude
+                // scales with √env (the smoothed dry-input level) so the
+                // noise sits as a layer on top of the program material
+                // rather than tracking the instantaneous waveform.  At
+                // Dust=0 dustG is exactly 0 and the contribution
+                // collapses to zero without a branch; the PRNG advance
+                // is unconditional to keep the noise pattern continuous
+                // when Dust is dialled in mid-render.
+                drL += _chL.NextDust() * dustG * MathF.Sqrt(envL);
+                drR += _chR.NextDust() * dustG * MathF.Sqrt(envR);
+
                 // ── 4. Waveshape ───────────────────────────────────────
                 float shL = Shapers.Apply(shape, drL);
                 float shR = Shapers.Apply(shape, drR);
+
+                // ── 4b. Hysteresis (v1.1) — asymmetric one-pole lag on
+                // the shaper output.  At Hysteresis=0 both coefs are 1.0
+                // and the call is `state = target` — transparent, no
+                // branch needed in the caller (the branch on diff sign
+                // inside Hysteresis is unavoidable and well-predicted).
+                shL = _chL.Hysteresis(shL, hystUp, hystDown);
+                shR = _chR.Hysteresis(shR, hystUp, hystDown);
 
                 // ── 5. DC block (removes Bias DC + shape asymmetry) ───
                 float dcL = _chL.DcBlock(shL);
