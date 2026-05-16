@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Mandatory project-wide properties (Build §1.2) -->
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <GenerateDependencyFile>false</GenerateDependencyFile>
+    <NoWarn>MSB3277</NoWarn>
+
+    <!-- AssemblyName drives the machine-browser display name (Build §2,
+         PedalComp §3).  The ".NET" suffix is mandatory — without it,
+         ReBuzz calls native LoadLibrary and fails. -->
+    <AssemblyName>Pedal Shaper.NET</AssemblyName>
+    <RootNamespace>PedalShaper</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="BuzzGUI.Interfaces">
+      <HintPath>C:\Program Files\ReBuzz\BuzzGUI.Interfaces.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- Mandatory post-build deploy target (Build §1.3).
+       This is an effect, so the destination is Gear\Effects.
+       $(TargetPath) deploys just the .dll — never .pdb or .deps.json,
+       which §1.2 has already suppressed.
+       ContinueOnError handles the case where ReBuzz has the DLL open. -->
+  <Target Name="DeployToReBuzz" AfterTargets="Build">
+    <Message Text="Deploying $(TargetFileName) → C:\Program Files\ReBuzz\Gear\Effects\"
+             Importance="high" />
+    <Copy SourceFiles="$(TargetPath)"
+          DestinationFolder="C:\Program Files\ReBuzz\Gear\Effects\"
+          ContinueOnError="true" />
+  </Target>
+
+</Project>
